@@ -1,136 +1,117 @@
+module HeartSimulation
+
 using Agents
 using Random
-using Statistics
+using Graphs
 
-@agent struct Heart(NoSpaceAgent)
-	contractility::Float64 
-	rate::Float64   
-	current_phase::Symbol
-	phase_timer::Float64
+mutable struct Heart <: AbstractAgent
+    id::Int
+    pos::Tuple{Int, Int}  
+    state::Symbol 
+    contractile_force::Float64
+    cycle_time::Int
 end
 
-@agent struct Tissue(NoSpaceAgent)
-	resistance::Float64
-	compliance::Float64
-	current_pressure::Float64
-	blood_volume::Float64
+mutable struct BloodVessel <: AbstractAgent
+    id::Int
+    pos::Tuple{Int, Int} 
+    pressure::Float64
+    elasticity::Float64
+    resistance::Float64
 end
 
-function initialize_cardio_model(;
-	n_tissues = 10,
-	target_systolic = 120,
-	target_diastolic = 80,
-	base_heart_rate = 75
-)
-	properties = Dict(
-    	:target_systolic => target_systolic,
-    	:target_diastolic => target_diastolic,
-    	:system_pressure => target_diastolic,
-    	:total_blood_volume => 5000.0,  
-    	:cardiac_output => 0.0,     	
-    	:mean_pressure => 0.0
-	)
+
+const SYSTOLIC_TARGET = 120.0
+const DIASTOLIC_TARGET = 80.0
+const HEART_RATE = 60
+const TIME_STEPS_PER_BEAT = 60
+
+
+function initialize_heart_model()
+
+    space = GridSpace((1, 1))
     
-	model = ABM(Union{Heart, Tissue}; properties)
+    properties = Dict(
+        :vessel => nothing 
+    )
+    
+    model = AgentBasedModel(
+        Union{Heart, BloodVessel},
+        space;
+        properties = properties
+    )
     
 
-	heart = Heart(
-        11,
-    	0.7,          
-    	base_heart_rate,
-    	:diastole,
-    	0.0
-	)
-	add_agent!(heart, model)
+    heart = Heart(nextid(model), (1, 1), :relaxing, 1.0, 0)
+    add_agent_pos!(heart, model)
+
+    vessel = BloodVessel(nextid(model), (1, 1), DIASTOLIC_TARGET, 0.8, 0.1)
+    add_agent_pos!(vessel, model)
+    model.properties[:vessel] = vessel
     
-	
-	for i in 1:n_tissues
-    	
-    	resistance = 0.8 + rand() * 0.4	
-    	compliance = 0.6 + rand() * 0.8	
-   	 
-    	tissue = Tissue(
-            i,
-        	resistance,
-        	compliance,
-        	properties[:target_diastolic],
-        	properties[:total_blood_volume] / n_tissues
-    	)
-    	add_agent!(tissue, model)
-	end
-    
-	return model
+    return model
 end
+
+function heart_step!(heart::Heart, model)
+
+    heart.cycle_time += 1
+    
+    if heart.cycle_time >= TIME_STEPS_PER_BEAT
+        heart.cycle_time = 0
+        heart.state = heart.state == :contracting ? :relaxing : :contracting
+    end
+    
+
+    if heart.state == :contracting
+
+        heart.contractile_force = sin(π * heart.cycle_time / TIME_STEPS_PER_BEAT)
+    else
+
+        heart.contractile_force = 0.2 * sin(π * heart.cycle_time / TIME_STEPS_PER_BEAT)
+    end
+    
+
+    vessel = model.properties[:vessel]
+    if heart.state == :contracting
+
+        pressure_range = SYSTOLIC_TARGET - DIASTOLIC_TARGET
+        target_pressure = DIASTOLIC_TARGET + (pressure_range * heart.contractile_force)
+    else
+
+        pressure_above_diastolic = vessel.pressure - DIASTOLIC_TARGET
+        target_pressure = DIASTOLIC_TARGET + (pressure_above_diastolic * vessel.elasticity)
+    end
+    
+    vessel.pressure += (target_pressure - vessel.pressure) * (1 - vessel.resistance)
+end
+
 
 function model_step!(model)
-	update_system_pressure!(model)
-	calculate_cardiac_output!(model)
+    for agent in allagents(model)
+        if agent isa Heart
+            heart_step!(agent, model)
+        end
+    end
 end
 
-function agent_step!(agent::Heart, model)
+function run_heart_simulation(steps=300)
+    model = initialize_heart_model()
+    pressures = Float64[]
+    
+    for _ in 1:steps
+        model_step!(model)
+        vessel = model.properties[:vessel]
+        push!(pressures, vessel.pressure)
+    end
+    
+	print(pressures)
 
-	cycle_duration = 60.0 / agent.rate
-	systole_duration = 0.3
-    
-	agent.phase_timer += 1/60
-    
-	if agent.current_phase == :systole
-    	if agent.phase_timer >= systole_duration
-        	agent.current_phase = :diastole
-        	agent.phase_timer = 0.0
-    	end
-	else
-    	if agent.phase_timer >= (cycle_duration - systole_duration)
-        	agent.current_phase = :systole
-        	agent.phase_timer = 0.0
-    	end
-	end
-    
-	if agent.current_phase == :systole
-    	target = model.target_systolic * agent.contractility
-	else
-    	target = model.target_diastolic
-	end
-    
-	model.system_pressure = target
+    return pressures
 end
 
-function agent_step!(agent::Tissue, model)
+export Heart, BloodVessel, initialize_heart_model, heart_step!, model_step!, run_heart_simulation
 
-	pressure_difference = model.system_pressure - agent.current_pressure
-	flow = pressure_difference / agent.resistance
-    
-	agent.current_pressure += flow * agent.compliance
-    
-
-	agent.blood_volume += flow
 end
 
-function update_system_pressure!(model)
+run_heart_simulation()
 
-	tissue_pressures = [a.current_pressure for a in allagents(model) if a isa Tissue]
-	model.mean_pressure = mean(tissue_pressures)
-end
-
-function calculate_cardiac_output!(model)
-	heart = getindex(model, 11)
-	if heart.current_phase == :systole
-
-    	stroke_volume = 70.0 * heart.contractility  
-    	model.cardiac_output = stroke_volume * heart.rate
-	end
-end
-
-# Analysis functions
-function get_pressure_range(model)
-	pressures = Float64[]
-	for _ in 1:100  
-    	step!(model, agent_step!, model_step!)
-    	push!(pressures, model.system_pressure)
-	end
-	return minimum(pressures), maximum(pressures)
-end
-
-model = initialize_cardio_model()
-min_p, max_p = get_pressure_range(model)
-println("Pressure range: $min_p / $max_p mmHg")
